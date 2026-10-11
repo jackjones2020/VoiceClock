@@ -50,7 +50,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             this.text = text; setOnClickListener { action() }; root.addView(this)
         }
         label("语音报时", 28f)
-        label("报时前响三声由弱到强的滴，每声 0.3 秒，然后以半速播报。开启后仅在选定星期和时段内报时。")
+        label("报时前响三声由弱到强的滴，每声 0.6 秒、间隔 0.4 秒，然后以半速播报。开启后仅在选定星期和时段内报时。")
         button("试听当前时间") {
             previewPending = true
             if (speechReady) preview()
