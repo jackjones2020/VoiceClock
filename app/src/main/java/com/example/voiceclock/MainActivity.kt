@@ -3,6 +3,8 @@ package com.example.voiceclock
 import android.Manifest
 import android.app.Activity
 import android.app.TimePickerDialog
+import android.net.Uri
+import android.speech.tts.UtteranceProgressListener
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -26,9 +28,11 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private var speechReady = false
     private var speechInitialized = false
     private var previewPending = false
+    private val previewTracker = SpeechTracker()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        SpeechHistory(this).use { it.clearExpired() }
         val saved = Settings.load(this)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -46,12 +50,18 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             this.text = text; setOnClickListener { action() }; root.addView(this)
         }
         label("语音报时", 28f)
-        label("试听会立即播报。开启后仅在选定星期和时段内报时；设置会保存在手机中。")
+        label("报时前响三声由弱到强的滴，每声 0.3 秒，然后以半速播报。开启后仅在选定星期和时段内报时。")
         button("试听当前时间") {
             previewPending = true
             if (speechReady) preview()
             else if (speechInitialized) { previewPending = false; status.text = "中文语音不可用，请检查系统文字转语音设置" }
             else status.text = "正在准备中文语音…"
+        }
+        button("查看今日报时记录") { startActivity(Intent(this, HistoryActivity::class.java)) }
+        label("锁屏报时使用系统闹钟唤醒；系统可能显示下一次闹钟标记。语音使用闹钟音量。", 14f)
+        button("设置锁屏报时权限") { openAlarmPermission() }
+        button("设置后台电池用量") {
+            startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
         }
         label("报时模式", 20f)
         mode = Spinner(this).apply {
@@ -94,19 +104,38 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         }
         button("保存并开启语音报时") {
             val schedule = readSchedule() ?: return@button
-            Settings.save(this, schedule); Settings.setEnabled(this, true)
+            Settings.save(this, schedule)
+            if (!ClockAlarms.permitted(this)) {
+                status.text = "请允许“闹钟和提醒”，返回后再次点击开启，才能在锁屏时准时报时"
+                openAlarmPermission(); return@button
+            }
+            Settings.setEnabled(this, true)
             startForegroundService(Intent(this, ClockService::class.java).setAction(ClockService.START))
             showStatus(if (schedule.allows(ZonedDateTime.now())) "已开启，将立即报时" else "已开启，当前不在报时时段", schedule)
         }
         button("停止报时") {
-            Settings.setEnabled(this, false); stopService(Intent(this, ClockService::class.java)); status.text = "已停止，设置已保留"
+            Settings.setEnabled(this, false); ClockAlarms.cancel(this); this@MainActivity.stopService(Intent(this@MainActivity, ClockService::class.java)); status.text = "已停止，设置已保留"
         }
         status = TextView(this).apply { textSize = 15f; setPadding(0, dp(16), 0, dp(16)) }
         root.addView(status)
         showStatus(if (Settings.enabled(this)) "报时已开启" else "当前未开启", saved)
         setContentView(scroll)
         tts = TextToSpeech(this, this)
-        if (Settings.enabled(this)) startForegroundService(Intent(this, ClockService::class.java).setAction(ClockService.RELOAD))
+        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String) = Unit
+            override fun onDone(utteranceId: String) {
+                if (TimeSpeech.isChime(utteranceId)) return
+                previewTracker.finish(utteranceId)?.let { record ->
+                    SpeechHistory(this@MainActivity).use { it.add(record) }
+                    runOnUiThread { status.text = "试听播放完成，已保存报时记录" }
+                }
+            }
+            override fun onError(utteranceId: String) {
+                previewTracker.fail(TimeSpeech.speechId(utteranceId))
+                runOnUiThread { status.text = "试听失败，请检查系统语音和提示音播放" }
+            }
+            override fun onStop(utteranceId: String, interrupted: Boolean) { previewTracker.fail(TimeSpeech.speechId(utteranceId)) }
+        })
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 10)
     }
@@ -144,7 +173,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
     private fun showStatus(message: String, schedule: Schedule) {
         val now = ZonedDateTime.now()
-        val next = schedule.next(now, now)
+        val next = if (Settings.enabled(this)) ClockAlarms.next(this) else schedule.next(now, now)
         status.text = "$message\n${Schedule.modes[schedule.mode]}\n下一次计划：${next?.format(DateTimeFormatter.ofPattern("M月d日 HH:mm")) ?: "没有可用时间"}"
     }
 
@@ -152,7 +181,8 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         speechInitialized = true
         if (result == TextToSpeech.SUCCESS) {
             val language = tts?.setLanguage(Locale.SIMPLIFIED_CHINESE)
-            speechReady = language != null && language >= TextToSpeech.LANG_AVAILABLE
+            speechReady = language != null && language >= TextToSpeech.LANG_AVAILABLE &&
+                tts?.let { TimeSpeech.configure(it, packageName) } == true
         }
         if (previewPending) {
             if (speechReady) preview() else { previewPending = false; status.text = "中文语音不可用，请在系统文字转语音设置中安装中文语音" }
@@ -162,10 +192,30 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private fun preview() {
         previewPending = false
         val now = ZonedDateTime.now()
-        val result = tts?.speak("现在时间，${now.hour}点${now.minute}分", TextToSpeech.QUEUE_FLUSH, null, "preview")
-        status.text = if (result == TextToSpeech.SUCCESS) "已试听当前时间（不受星期或时段限制）" else "试听失败，请检查系统语音设置"
+        previewTracker.clear()
+        val text = "现在时间，${now.hour}点${now.minute}分"
+        val id = previewTracker.begin(SpeechRecord(now, text, "试听"))
+        val result = TimeSpeech.speak(tts, text, id)
+        if (result != TextToSpeech.SUCCESS) previewTracker.fail(id)
+        status.text = if (result == TextToSpeech.SUCCESS) "正在试听当前时间，播放完成后保存记录" else "试听失败，请检查系统语音设置"
     }
 
-    override fun onDestroy() { tts?.stop(); tts?.shutdown(); super.onDestroy() }
+    private fun openAlarmPermission() {
+        if (Build.VERSION.SDK_INT >= 31 && !ClockAlarms.permitted(this)) {
+            startActivity(Intent(android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:$packageName")))
+        } else status.text = "已具备锁屏报时所需闹钟权限"
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (!::status.isInitialized) return
+        if (Settings.enabled(this)) {
+            if (ClockAlarms.permitted(this)) {
+                startForegroundService(Intent(this, ClockService::class.java).setAction(ClockService.RESTORE))
+            } else status.text = "报时未能运行：请允许“闹钟和提醒”权限"
+        }
+    }
+
+    override fun onDestroy() { previewTracker.clear(); tts?.stop(); tts?.shutdown(); super.onDestroy() }
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
 }
